@@ -1,0 +1,22 @@
+name: Test
+
+on:
+- push
+- pull_request
+- workflow_dispatch
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Check out
+      uses: actions/checkout@v2
+      
+    - name: Set up .NET SDK
+      uses: actions/setup-dotnet@v1
+      with:
+        dotnet-version: 5.x
+    
+    - name: Run tests
+      run: dotnet test
