@@ -31,14 +31,14 @@ namespace SimpleTarball
 
         public IEnumerable<TarballEntry> ReadEntries()
         {
-            while (TarballEntry.ReadFrom(BaseStream, out TarballEntry entry))
+            while (ReadEntry(out TarballEntry entry))
             {
                 if (entry == null)
                 {
                     continue;
                 }
 
-                long nextEntryPosition = BaseStream.Position + (long)Math.Ceiling(entry.Content.Length / 512d) * 512;
+                long nextEntryPosition = BaseStream.Position + (long)Math.Ceiling(entry.Length / 512d) * 512;
 
                 yield return entry;
 
@@ -57,6 +57,34 @@ namespace SimpleTarball
             {
                 BaseStream.Dispose();
             }
+        }
+
+        private bool ReadEntry(out TarballEntry entry)
+        {
+            byte[] buffer = new byte[512];
+            int read = BaseStream.Read(buffer, 0, buffer.Length);
+
+            if (read != buffer.Length)
+            {
+                entry = null;
+                return false;
+            }
+
+            if (buffer.All(b => b == 0))
+            {
+                entry = null;
+                return true;
+            }
+
+            entry = new TarballEntry(
+                BaseStream,
+                BaseStream.Position - 512,
+                Encoding.UTF8.GetString(buffer, 0, 100).TrimEnd('\0'),
+                DateTimeOffset.FromUnixTimeSeconds(Convert.ToInt64(Encoding.ASCII.GetString(buffer, 136, 11), 8)),
+                Convert.ToInt64(Encoding.ASCII.GetString(buffer, 124, 11), 8)
+            );
+
+            return true;
         }
     }
 
@@ -83,59 +111,9 @@ namespace SimpleTarball
 
         public Stream BaseStream { get; }
 
-        public void WriteEntry(string path)
+        public TarballEntry CreateEntry(string fullName)
         {
-            if (string.IsNullOrEmpty(path))
-            {
-                throw new ArgumentNullException(nameof(path));
-            }
-
-            if (!File.Exists(path))
-            {
-                throw new FileNotFoundException("File not found", path);
-            }
-
-            FileInfo fileInfo = new FileInfo(path);
-
-            using (FileStream fileStream = fileInfo.OpenRead())
-            {
-                new TarballEntry { FullName = path, Content = fileStream, LastWriteTime = fileInfo.LastWriteTimeUtc }.WriteTo(BaseStream);
-            }
-        }
-
-        public void WriteEntry(string fullName, Stream stream)
-        {
-            if (string.IsNullOrEmpty(fullName))
-            {
-                throw new ArgumentNullException(nameof(TarballEntry.Content));
-            }
-
-            if (stream == null)
-            {
-                throw new ArgumentNullException(nameof(TarballEntry.Content));
-            }
-
-            if (!stream.CanRead)
-            {
-                throw new InvalidOperationException("Cannot read from stream");
-            }
-
-            new TarballEntry { FullName = fullName, Content = stream }.WriteTo(BaseStream);
-        }
-
-        public void WriteEntry(TarballEntry entry)
-        {
-            if (string.IsNullOrEmpty(entry.FullName))
-            {
-                throw new ArgumentNullException(nameof(TarballEntry.Content));
-            }
-
-            if (entry.Content == null)
-            {
-                throw new ArgumentNullException(nameof(TarballEntry.Content));
-            }
-
-            entry.WriteTo(BaseStream);
+            return new TarballEntry(BaseStream, BaseStream.Position, fullName, DateTimeOffset.UtcNow, 0);
         }
 
         public void Dispose()
@@ -166,51 +144,97 @@ namespace SimpleTarball
     // https://www.gnu.org/software/tar/manual/html_node/Standard.html
     public class TarballEntry
     {
-        public string FullName { get; set; }
+        private readonly Stream baseStream;
+        private readonly long startPosition;
+        private readonly long contentStartPosition;
 
-        public string FileMode { get; set; } = "0100777";
-
-        public DateTimeOffset LastWriteTime { get; set; } = DateTimeOffset.UtcNow;
-
-        public Stream Content { get; set; }
-
-        public static bool ReadFrom(Stream stream, out TarballEntry entry)
+        internal TarballEntry(Stream baseStream, long startPosition, string fullName, DateTimeOffset lastWriteTime, long length)
         {
-            byte[] buffer = new byte[512];
-            int read = stream.Read(buffer, 0, buffer.Length);
+            this.baseStream = baseStream;
+            this.startPosition = startPosition;
+            this.contentStartPosition = startPosition + 512;
 
-            if (read != buffer.Length)
-            {
-                entry = null;
-                return false;
-            }
-
-            if (buffer.All(b => b == 0))
-            {
-                entry = null;
-                return true;
-            }
-
-            entry = new TarballEntry
-            {
-                FullName = Encoding.UTF8.GetString(buffer, 0, 100).TrimEnd('\0'),
-                FileMode = Encoding.UTF8.GetString(buffer, 100, 7).TrimEnd('\0'),
-                LastWriteTime = DateTimeOffset.FromUnixTimeSeconds(Convert.ToInt64(Encoding.ASCII.GetString(buffer, 136, 11), 8)),
-                Content = new WrappedStream(stream, stream.Position, Convert.ToInt64(Encoding.ASCII.GetString(buffer, 124, 11), 8)),
-            };
-
-            return true;
+            this.FullName = fullName;
+            this.LastWriteTime = lastWriteTime;
+            this.Length = length;
         }
 
-        public void WriteTo(Stream stream)
+        public string FullName { get; }
+
+        public DateTimeOffset LastWriteTime { get; private set; }
+
+        public long Length { get; private set; }
+
+        public Stream OpenRead()
+        {
+            return new WrappedStream(this, contentStartPosition, Length, false);
+        }
+
+        public Stream OpenWrite()
+        {
+            return OpenWrite(default(DateTimeOffset));
+        }
+
+        public Stream OpenWrite(DateTimeOffset lastWriteTime)
+        {
+            return new BufferedWriteStream(this, lastWriteTime);
+        }
+
+        public Stream OpenWrite(long length)
+        {
+            return OpenWrite(default, length);
+        }
+
+        public Stream OpenWrite(DateTimeOffset lastWriteTime, long length)
+        {
+            LastWriteTime = !lastWriteTime.Equals(default) ? lastWriteTime : DateTimeOffset.UtcNow;
+            Length = length;
+
+            EnsureStart();
+            WriteHeader();
+
+            return new WrappedStream(this, contentStartPosition, length, true);
+        }
+
+        private void EnsureStart()
+        {
+            if (baseStream.Position != startPosition)
+            {
+                throw new InvalidOperationException($"Stream is not at expected entry start position (expected {startPosition}, got {baseStream.Position})");
+            }
+        }
+
+        private void EnsureContentStart()
+        {
+            if (baseStream.Position != contentStartPosition)
+            {
+                throw new InvalidOperationException($"Stream is not at expected content start position (expected {contentStartPosition}, got {baseStream.Position})");
+            }
+        }
+
+        private void EnsureEnd()
+        {
+            long contentEndPosition = contentStartPosition + Length;
+
+            if (baseStream.Position < contentEndPosition)
+            {
+                baseStream.Position = contentEndPosition;
+            }
+            else if (baseStream.Position > contentEndPosition)
+            {
+                throw new InvalidOperationException($"Stream is past expected end position (expected {contentEndPosition}, got {baseStream.Position})");
+            }
+        }
+
+        private void WriteHeader()
         {
             byte[] buffer = new byte[512];
 
             WriteString(FullName, Encoding.UTF8, 100, buffer, 0); // name
-            WriteString(FileMode, 7, buffer, 100); // mode
+            WriteString("0100777", 7, buffer, 100); // mode
             WriteInt32AsOctal(0, buffer, 108); // uid
             WriteInt32AsOctal(0, buffer, 116); // gid
-            WriteInt64AsOctal(Content.Length, buffer, 124); // size
+            WriteInt64AsOctal(Length, buffer, 124); // size
             WriteInt64AsOctal(LastWriteTime.ToUnixTimeSeconds(), buffer, 136); // mtime
             WriteString(new string(' ', 8), 8, buffer, 148); // checksum (calculated below)
             WriteString("ustar\000", 8, buffer, 257); // magic + version
@@ -229,15 +253,17 @@ namespace SimpleTarball
             // checksum (calculated)
             Encoding.UTF8.GetBytes(Convert.ToString(checksum, 8).PadLeft(6, '0').Substring(0, 6) + "\0 ", 0, 7, buffer, 148);
 
-            stream.Write(buffer, 0, buffer.Length);
+            baseStream.Write(buffer, 0, buffer.Length);
+        }
 
-            Content.CopyTo(stream);
+        private void WritePadding()
+        {
+            EnsureEnd();
 
-            // pad last block with NULs
-            if (Content.Length % 512 != 0)
+            if (Length % 512 != 0)
             {
-                byte[] padding = new byte[512 - Content.Length % 512];
-                stream.Write(padding, 0, padding.Length);
+                byte[] padding = new byte[512 - (Length % 512)];
+                baseStream.Write(padding, 0, padding.Length);
             }
         }
 
@@ -278,29 +304,36 @@ namespace SimpleTarball
 
         private class WrappedStream : Stream
         {
-            private readonly Stream baseStream;
+            private readonly TarballEntry entry;
             private readonly long startPosition;
 
-            public WrappedStream(Stream baseStream, long startPosition, long length)
+            private bool isOpen = true;
+
+            public WrappedStream(TarballEntry entry, long startPosition, long length, bool write)
             {
-                this.baseStream = baseStream;
+                entry.EnsureContentStart();
+
+                CanRead = !write;
+                CanWrite = write;
+
+                this.entry = entry;
                 this.startPosition = startPosition;
 
                 Length = length;
             }
 
-            public override bool CanRead => true;
+            public override bool CanRead { get; }
 
             public override bool CanSeek => false;
 
-            public override bool CanWrite => false;
+            public override bool CanWrite { get; }
 
             public override long Length { get; }
 
             public override long Position
             {
-                get => baseStream.Position - startPosition;
-                set => baseStream.Position = startPosition + value;
+                get => entry.baseStream.Position - startPosition;
+                set => entry.baseStream.Position = startPosition + value;
             }
 
             public override void Flush()
@@ -310,13 +343,23 @@ namespace SimpleTarball
 
             public override int Read(byte[] buffer, int offset, int count)
             {
+                if (!CanRead)
+                {
+                    throw new InvalidOperationException("Stream is write-only");
+                }
+
+                if (!isOpen)
+                {
+                    throw new InvalidOperationException("Cannot read from a closed stream");
+                }
+
                 if (count < 0)
                 {
                     throw new ArgumentOutOfRangeException(nameof(count));
                 }
 
                 count = (int)Math.Min(count, Length - Position);
-                return baseStream.Read(buffer, offset, count);
+                return entry.baseStream.Read(buffer, offset, count);
             }
 
             public override long Seek(long offset, SeekOrigin origin)
@@ -331,7 +374,70 @@ namespace SimpleTarball
 
             public override void Write(byte[] buffer, int offset, int count)
             {
-                throw new NotImplementedException();
+                if (!CanWrite)
+                {
+                    throw new InvalidOperationException("Stream is read-only");
+                }
+
+                if (!isOpen)
+                {
+                    throw new InvalidOperationException("Cannot write to a closed stream");
+                }
+
+                if (Position + count > Length)
+                {
+                    throw new InvalidOperationException("Attempted to write outside stream bounds");
+                }
+
+                entry.baseStream.Write(buffer, offset, count);
+            }
+
+            public override void Close()
+            {
+                if (isOpen)
+                {
+                    if (CanWrite)
+                    {
+                        entry.WritePadding();
+                    }
+
+                    isOpen = false;
+                }
+
+                base.Close();
+            }
+        }
+
+        private class BufferedWriteStream : MemoryStream
+        {
+            private readonly TarballEntry entry;
+            private readonly DateTimeOffset lastWriteTime;
+
+            private bool isOpen = true;
+
+            public BufferedWriteStream(TarballEntry entry, DateTimeOffset lastWriteTime)
+            {
+                this.entry = entry;
+                this.lastWriteTime = lastWriteTime;
+            }
+
+            public override void Close()
+            {
+                if (isOpen)
+                {
+                    entry.EnsureStart();
+                    entry.LastWriteTime = !lastWriteTime.Equals(default) ? lastWriteTime : DateTimeOffset.UtcNow;
+                    entry.Length = Length;
+                    entry.WriteHeader();
+
+                    Position = 0;
+                    CopyTo(entry.baseStream);
+                    entry.WritePadding();
+
+                    isOpen = false;
+                }
+
+                base.Close();
             }
         }
     }
